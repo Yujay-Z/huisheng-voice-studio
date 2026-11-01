@@ -1,0 +1,13 @@
+.runtime/
+.tools/
+.cache/
+.venv/
+engines/
+models/
+data/
+logs/
+__pycache__/
+*.pyc
+dist/
+runtime/
+offline-package.json

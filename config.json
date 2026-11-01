@@ -1,0 +1,8 @@
+{
+  "app_name": "音色工作室",
+  "host": "127.0.0.1",
+  "port": 7865,
+  "asr_model": "small",
+  "preload_on_start": true,
+  "max_segment_chars": 72
+}
