@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,6 +17,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--repository', required=True)
     parser.add_argument('--bundle', type=Path, required=True)
+    parser.add_argument('--resume-upload', action='store_true')
     args = parser.parse_args()
     if not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', args.repository):
         raise RuntimeError('Invalid repository name.')
@@ -23,15 +25,24 @@ def main():
     if not gh.is_file():
         raise RuntimeError('Install GitHub CLI and log in first.')
     env = {**os.environ, 'GH_CONFIG_DIR': str(ROOT / '.tools/github-auth'),
-           'GH_PROMPT_DISABLED': '1', 'GH_PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0'}
+           'GH_PROMPT_DISABLED': '1', 'GH_PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0',
+           'GODEBUG': 'http2client=0'}
     git = shutil.which('git')
     if not git:
         raise RuntimeError('Git is required on the build/publish computer.')
 
     def run(command, *, check=True):
-        result = subprocess.run([str(c) for c in command], cwd=ROOT, env=env,
-                                capture_output=True, text=True, encoding='utf-8', errors='replace',
-                                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        command = [str(c) for c in command]
+        read_only = len(command)>1 and (command[1]=='api' and '-X' not in command or command[1:3] in [['repo','view'],['release','view']])
+        for attempt in range(4):
+            result = subprocess.run(command, cwd=ROOT, env=env,
+                                    capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            transient = any(word in (result.stderr+result.stdout).lower() for word in ['eof','tls','timeout','timed out','connection reset','failed to connect'])
+            if result.returncode==0 or not read_only or not transient or attempt==3:
+                break
+            print(f'Network read retry {attempt+1}/3',flush=True)
+            time.sleep(2**attempt)
         if check and result.returncode:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip())
         return result
@@ -49,50 +60,57 @@ def main():
     version = manifest['version']
     tag = 'v' + version
 
-    # The repository contains only application source, tests and build tooling.
-    if not (ROOT / '.git').exists():
-        run([git, 'init', '--initial-branch=main'])
-    run([git, 'config', 'user.name', login])
-    run([git, 'config', 'user.email', f'{json.loads(run([gh,"api","user"]).stdout)["id"]}+{login}@users.noreply.github.com'])
-    helper = '!"' + gh.as_posix() + '" auth git-credential'
-    run([git, 'config', 'credential.https://github.com.helper', helper])
-    selected = ['.gitignore', 'README.md', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'requirements.txt',
-                'voiceclone', 'web', 'scripts', 'tests', 'distribution']
-    selected += [p.name for p in ROOT.glob('*.py')]
-    selected += [p.name for p in ROOT.glob('*.pyw')]
-    selected += [p.name for p in ROOT.glob('*.cmd')]
-    selected += ['config.json']
-    run([git, 'add', '--', *selected])
-    tracked = run([git, 'ls-files', '-z']).stdout.split('\0')
-    forbidden = {'data', 'logs', '.tools', '.cache', '.venv', 'runtime', 'models', 'engines', 'dist'}
-    for name in filter(None, tracked):
-        if name.split('/')[0] in forbidden or (ROOT / name).stat().st_size > 10 * 1024**2:
-            raise RuntimeError('Private or oversized file would enter Git: ' + name)
-        raw = (ROOT / name).read_bytes()
-        if re.search(rb'gh[opusr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{30,}', raw):
-            raise RuntimeError('A credential-like value was found in staged source: ' + name)
-    diff = run([git, 'diff', '--cached', '--quiet'], check=False)
-    if diff.returncode:
-        run([git, 'commit', '-m', 'Package complete Windows offline voice studio v' + version])
+    if args.resume_upload:
+        privacy = json.loads(run([gh, 'repo', 'view', args.repository, '--json', 'isPrivate']).stdout)
+        if not privacy['isPrivate']:
+            raise RuntimeError('Refusing to upload private artifacts to a public repository.')
+    else:
+        # The repository contains only application source, tests and build tooling.
+        if not (ROOT / '.git').exists():
+            run([git, 'init', '--initial-branch=main'])
+        run([git, 'config', 'user.name', login])
+        run([git, 'config', 'user.email', f'{json.loads(run([gh,"api","user"]).stdout)["id"]}+{login}@users.noreply.github.com'])
+        helper = '!"' + gh.as_posix() + '" auth git-credential'
+        run([git, 'config', 'credential.https://github.com.helper', helper])
+        selected = ['.gitignore', 'README.md', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'requirements.txt',
+                    'voiceclone', 'web', 'scripts', 'tests', 'distribution']
+        selected += [p.name for p in ROOT.glob('*.py')]
+        selected += [p.name for p in ROOT.glob('*.pyw')]
+        selected += [p.name for p in ROOT.glob('*.cmd')]
+        selected += ['config.json']
+        run([git, 'add', '--', *selected])
+        tracked = run([git, 'ls-files', '-z']).stdout.split('\0')
+        forbidden = {'data', 'logs', '.tools', '.cache', '.venv', 'runtime', 'models', 'engines', 'dist'}
+        for name in filter(None, tracked):
+            if name.split('/')[0] in forbidden or (ROOT / name).stat().st_size > 10 * 1024**2:
+                raise RuntimeError('Private or oversized file would enter Git: ' + name)
+            raw = (ROOT / name).read_bytes()
+            if re.search(rb'gh[opusr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{30,}', raw):
+                raise RuntimeError('A credential-like value was found in staged source: ' + name)
+        diff = run([git, 'diff', '--cached', '--quiet'], check=False)
+        if diff.returncode:
+            run([git, 'commit', '-m', 'Package complete Windows offline voice studio v' + version])
 
-    found = run([gh, 'repo', 'view', args.repository, '--json', 'isPrivate,url'], check=False)
-    if found.returncode:
-        run([gh, 'repo', 'create', args.repository, '--private', '--source', str(ROOT), '--remote', 'origin',
-             '--description', 'Windows offline IndexTTS 2.5 voice studio with three takes, transcripts, cropping and stem separation'])
-    elif not json.loads(found.stdout)['isPrivate']:
-        raise RuntimeError('Refusing to publish private artifacts to a public repository.')
-    expected_remote = 'https://github.com/' + args.repository + '.git'
-    remote = run([git, 'remote', 'get-url', 'origin'], check=False)
-    if remote.returncode:
-        run([git, 'remote', 'add', 'origin', expected_remote])
-    elif remote.stdout.strip() != expected_remote:
-        raise RuntimeError('Origin points to a different repository; refusing to overwrite it.')
-    run([git, 'push', '-u', 'origin', 'main'])
-    if run([git, 'rev-parse', '--verify', tag], check=False).returncode:
-        run([git, 'tag', '-a', tag, '-m', 'Verified Windows offline release ' + version])
-    run([git, 'push', 'origin', tag])
+        found = run([gh, 'repo', 'view', args.repository, '--json', 'isPrivate,url'], check=False)
+        if found.returncode:
+            run([gh, 'repo', 'create', args.repository, '--private', '--source', str(ROOT), '--remote', 'origin',
+                 '--description', 'Windows offline IndexTTS 2.5 voice studio with three takes, transcripts, cropping and stem separation'])
+        elif not json.loads(found.stdout)['isPrivate']:
+            raise RuntimeError('Refusing to publish private artifacts to a public repository.')
+        expected_remote = 'https://github.com/' + args.repository + '.git'
+        remote = run([git, 'remote', 'get-url', 'origin'], check=False)
+        if remote.returncode:
+            run([git, 'remote', 'add', 'origin', expected_remote])
+        elif remote.stdout.strip() != expected_remote:
+            raise RuntimeError('Origin points to a different repository; refusing to overwrite it.')
+        run([git, 'push', '-u', 'origin', 'main'])
+        if run([git, 'rev-parse', '--verify', tag], check=False).returncode:
+            run([git, 'tag', '-a', tag, '-m', 'Verified Windows offline release ' + version])
+        run([git, 'push', 'origin', tag])
     existing = run([gh, 'release', 'view', tag, '--repo', args.repository, '--json', 'isDraft'], check=False)
     if existing.returncode:
+        if args.resume_upload:
+            raise RuntimeError('The existing draft could not be located; no new release was created.')
         run([gh, 'release', 'create', tag, '--repo', args.repository, '--verify-tag', '--draft',
              '--title', '回声 · Windows 离线版 ' + version,
              '--notes-file', ROOT / 'distribution/RELEASE_NOTES.md'])
@@ -114,6 +132,7 @@ def main():
     info = release_info()
     present = {a['name']: a for a in info['assets']}
     tasks = [p for p in assets if p.name not in present]
+    tasks.sort(key=lambda p:(p.stat().st_size>5*1024**2,-p.stat().st_size if p.stat().st_size>5*1024**2 else p.name))
     for path in assets:
         if path.name in present and present[path.name]['size'] != path.stat().st_size:
             raise RuntimeError('Existing release asset differs; it was not overwritten: ' + path.name)
