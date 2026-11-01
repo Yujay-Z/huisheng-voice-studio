@@ -105,7 +105,13 @@ def main():
             raise RuntimeError('A release asset exceeds the GitHub limit: ' + path.name)
     # Separate assets may upload independently. A failed upload is retried on
     # the next invocation, while completed, matching assets are left untouched.
-    info = json.loads(run([gh, 'api', f'repos/{args.repository}/releases/tags/{tag}']).stdout)
+    def release_info():
+        # The by-tag REST endpoint only returns published releases. A draft
+        # must be located in the authenticated owner's release list instead.
+        items = json.loads(run([gh, 'api', f'repos/{args.repository}/releases?per_page=100']).stdout)
+        return next(item for item in items if item['tag_name'] == tag)
+
+    info = release_info()
     present = {a['name']: a for a in info['assets']}
     tasks = [p for p in assets if p.name not in present]
     for path in assets:
@@ -122,7 +128,7 @@ def main():
         futures = [pool.submit(upload, path) for path in tasks]
         for future in as_completed(futures):
             print('Uploaded: ' + future.result(), flush=True)
-    info = json.loads(run([gh, 'api', f'repos/{args.repository}/releases/tags/{tag}']).stdout)
+    info = release_info()
     present = {a['name']: a for a in info['assets']}
     local_digests = dict(line.split(' *', 1)[::-1] for line in (bundle / 'SHA256SUMS.txt').read_text().splitlines() if ' *' in line)
     for path in assets:
